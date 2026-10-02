@@ -6,7 +6,9 @@ export function App() {
   return (
     <>
       <header className="app-header">
-        <h1>pixel-commit playground</h1>
+        <h1>
+          pixel-commit playground <span className="badge">Recorded on every commit</span>
+        </h1>
         <nav>
           <a href="#signup">Signup</a>
           <a href="#events">Events</a>
