@@ -1,0 +1,17 @@
+{
+  "name": "pixel-commit-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "playground"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w playground",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "record:demo": "npm run record:demo -w playground"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

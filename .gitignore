@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.pixel-commit/
+
+# Cypress output
+playground/cypress/videos/
+playground/cypress/screenshots/
+playground/cypress/downloads/
+
+*.log
+.DS_Store
