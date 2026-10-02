@@ -16,6 +16,7 @@ const playgroundDir = path.resolve(import.meta.dirname, "..");
 const repoRoot = path.resolve(playgroundDir, "..");
 const outDir = path.join(repoRoot, ".pixel-commit", "videos", "manual");
 const SPEC = "cypress/e2e/date-filter.cy.ts";
+const MAX_TRIM_SECONDS = 15;
 
 async function main() {
   // Set by VS Code (and inherited by its terminals and git hooks). Makes the
@@ -48,15 +49,20 @@ async function main() {
 
   mkdirSync(outDir, { recursive: true });
   const dest = path.join(outDir, path.basename(video));
-  copyFileSync(video, dest);
+  const ffmpeg = findFfmpeg();
+  const trimmed = trimLoadingScreen(ffmpeg, video, dest);
+  if (trimmed === null) copyFileSync(video, dest);
 
   const sizeMb = statSync(dest).size / (1024 * 1024);
-  const duration = videoDuration(dest);
+  const duration = videoDuration(ffmpeg, dest);
 
   console.log("");
   console.log(`Video:    ${dest}`);
   console.log(`Size:     ${sizeMb.toFixed(2)} MB`);
   console.log(`Duration: ${duration}`);
+  console.log(
+    `Trimmed:  ${trimmed === null ? "nothing (no loading screen found)" : `${trimmed.toFixed(2)} s loading screen`}`,
+  );
   console.log(`Tests:    ${results.totalPassed} passed, ${results.totalFailed} failed`);
 
   if (results.totalFailed > 0) process.exitCode = 1;
@@ -108,9 +114,45 @@ function findFfmpeg(): string {
   return "ffmpeg";
 }
 
+/**
+ * Every video opens on a static Cypress placeholder (~4s) while the spec
+ * loads. The first scene change is the app appearing; cut everything before
+ * it. Re-encodes, because Cypress writes a keyframe only every 10s and a
+ * stream copy (-c copy) can only cut on keyframes. Returns seconds removed,
+ * or null if nothing was written to `dest` (caller should copy instead).
+ */
+function trimLoadingScreen(ffmpeg: string, src: string, dest: string): number | null {
+  const detect = spawnSync(
+    ffmpeg,
+    ["-hide_banner", "-i", src, "-vf", "select='gt(scene,0.1)',showinfo", "-frames:v", "1", "-f", "null", "-"],
+    { encoding: "utf8" },
+  );
+  const match = /pts_time:(\d+(?:\.\d+)?)/.exec(detect.stderr ?? "");
+  const start = match ? Number(match[1]) : 0;
+  // Nothing to cut, or a "change" so late it is more likely a broken video.
+  if (start < 0.5 || start > MAX_TRIM_SECONDS) return null;
+
+  const encode = spawnSync(
+    ffmpeg,
+    [
+      "-v", "error", "-y",
+      "-ss", start.toFixed(3), "-i", src,
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart", "-an",
+      dest,
+    ],
+    { encoding: "utf8" },
+  );
+  if (encode.status !== 0) {
+    console.warn(`Could not trim video, keeping it untrimmed: ${encode.stderr || encode.error}`);
+    return null;
+  }
+  return start;
+}
+
 /** ffmpeg -i prints "Duration: HH:MM:SS.xx" on stderr (and exits 1: no output given). */
-function videoDuration(file: string): string {
-  const probe = spawnSync(findFfmpeg(), ["-hide_banner", "-i", file], { encoding: "utf8" });
+function videoDuration(ffmpeg: string, file: string): string {
+  const probe = spawnSync(ffmpeg, ["-hide_banner", "-i", file], { encoding: "utf8" });
   const match = /Duration: (\d+):(\d+):(\d+(?:\.\d+)?)/.exec(probe.stderr ?? "");
   if (!match) return "unknown (ffmpeg not found or unreadable video)";
   const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
