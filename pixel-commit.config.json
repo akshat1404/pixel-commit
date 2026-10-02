@@ -1,0 +1,7 @@
+{
+  "projectDir": "playground",
+  "startCommand": "node ../node_modules/vite/bin/vite.js --port {port} --strictPort",
+  "baseUrl": "http://localhost:{port}",
+  "specPattern": "cypress/e2e/**/*.cy.ts",
+  "keepLast": 30
+}
