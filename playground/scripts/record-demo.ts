@@ -31,6 +31,8 @@ async function main() {
       spec: path.join(playgroundDir, SPEC),
       browser: "electron",
       headless: true,
+      // Record only the app, not Cypress's command log / URL bar around it.
+      runnerUi: false,
     });
   } finally {
     server.kill();
