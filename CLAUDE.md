@@ -76,8 +76,14 @@ playground/            React + Vite demo app (port 5173) used as test target
 (`#pixel-commit-caption`), dark semi-transparent background, white 28px text,
 `pointer-events: none` so it never blocks Cypress actions. One caption at a
 time. Re-injected on `window:load` (navigation) and by a `MutationObserver`
-if removed. Reset in `beforeEach`. Verified: survives `cy.reload`, `cy.visit`,
-element removal, `body.innerHTML` wipe.
+if removed. Reset in `beforeEach`. Not drawn on `about:blank` (where Cypress
+parks the app frame between tests). Verified: survives `cy.reload`,
+`cy.visit`, element removal, `body.innerHTML` wipe.
+
+Same file injects `#pixel-commit-ticker` into every app page: a fixed 1px
+element whose background alpha flips each `requestAnimationFrame`, kept alive
+by the same observer. Needed for `runnerUi: false` videos (see below). Don't
+remove it without re-checking a frame contact sheet.
 
 ## Cypress facts (checked against docs, Cypress 16.1.1)
 
@@ -92,8 +98,15 @@ element removal, `body.innerHTML` wipe.
   Cypress could not start, result is `{ status: "failed", message, ... }`
   instead (narrow with `"status" in result`).
 - Cypress 16 requires Node 22.x, 24.x or >=26.
-- Recorded video is the whole runner (command log left, app scaled to ~62% on
-  the right), 1280x720, 25fps, H.264.
+- By default the video is the whole runner (command log left, app scaled to
+  ~62%). We pass `runnerUi: false` to `cypress.run()` (CLI: `--no-runner-ui`;
+  default `true` unless Test Replay is on) so the video is only the app,
+  1280x720 at 100%, 25fps, H.264.
+- With `runnerUi: false`, capture only gets frames when the page repaints
+  (seen in Electron, Chrome and Edge): static stretches came out blank or
+  frozen and steps went missing. Chrome/Edge also recorded at odd sizes
+  (1264x624). Fix: the support file injects a 1px repaint ticker (see
+  cy.caption below). Electron is the recording browser.
 - Cypress bundles ffmpeg at
   `<cypress cache>/<version>/**/@ffmpeg-installer/<platform>-<arch>/ffmpeg[.exe]`
   (cache dir from `cypress cache path`). Used for duration/frames; no
@@ -121,7 +134,12 @@ element removal, `body.innerHTML` wipe.
   project's `typescript` JS API, which TS 7 may not provide. Revisit when
   Cypress documents TS 7 support. TS 6 note: default `types` is `[]`, so every
   tsconfig lists its `types` explicitly.
-- First ~3s of each video is the Cypress runner's "Your tests are loading"
-  screen.
-- With a 1280x720 viewport, the bottom caption can overlap the last item of
-  tall content (seen over the Events card's last row).
+- First ~4s of each video is a blank Cypress placeholder while the spec loads.
+  Could be trimmed with ffmpeg later.
+- Bottom caption can still cover content near the bottom of a 720px viewport.
+
+## Checking a video
+
+You can't watch it; build a 1fps contact sheet and look for blank/frozen
+stretches and caption/step order (ffmpeg path: see Cypress facts):
+`ffmpeg -i <video> -vf "fps=1,scale=320:-1,tile=5x5" -frames:v 1 sheet.png`
