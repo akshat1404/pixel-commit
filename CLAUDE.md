@@ -62,7 +62,8 @@ playground/            React + Vite demo app (port 5173) used as test target
 - Dependencies: free/open source, latest stable, each justifiable in one
   sentence. Prefer Node built-ins (`fs.globSync`, `fetch`, `child_process`).
 - Playground: plain CSS, no UI library. Interactive elements get `data-testid`.
-- Specs: happy path only. Each `it()` starts with `cy.caption(...)`.
+- Specs: happy path only. Each test must `cy.visit()` (in `it()` or
+  `beforeEach`), because test isolation is off. Each `it()` starts with `cy.caption(...)`.
   `cy.caption` already pauses 1.5s (option `{ pause }`); use 500-800ms
   `cy.wait` between actions (spec uses `BEAT = 650`). Too slow is easier to fix
   than too fast. Specs and support files `export {}` so they are modules.
@@ -140,8 +141,15 @@ remove it without re-checking a frame contact sheet.
   (Cypress writes a keyframe only every 10s, so `-c copy` can't cut
   accurately). Skips trimming if no change is found or it is past 15s. The raw
   video in `cypress/videos/` is overwritten with the trimmed one too.
-- Between tests, Cypress shows its "Default blank page" (test isolation) for
-  ~1s; visible in the video. Not trimmed yet.
+- `testIsolation` is `false` in `cypress.config.ts`. With `true`, Cypress
+  navigates to `about:blank` before each test, and its "Default blank page"
+  showed for ~1s between tests in the video. The support `beforeEach` does
+  the rest of isolation itself (`cy.clearAllCookies/LocalStorage/
+  SessionStorage`, all domains; verified). Consequence: the page is NOT reset,
+  so every test (or its `beforeEach`) must `cy.visit()`. IndexedDB was never
+  cleared by Cypress either way. (Per-frame entropy was tried for cutting the
+  blank page out of the video instead; it doesn't separate blank from app
+  frames.)
 - Bottom caption can still cover content near the bottom of a 720px viewport.
 
 ## Checking a video
