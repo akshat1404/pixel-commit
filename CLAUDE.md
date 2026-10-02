@@ -134,8 +134,14 @@ remove it without re-checking a frame contact sheet.
   project's `typescript` JS API, which TS 7 may not provide. Revisit when
   Cypress documents TS 7 support. TS 6 note: default `types` is `[]`, so every
   tsconfig lists its `types` explicitly.
-- First ~4s of each video is a blank Cypress placeholder while the spec loads.
-  Could be trimmed with ffmpeg later.
+- Each raw video opens on ~3-4s of static Cypress placeholder while the spec
+  loads. `record-demo.ts` trims it: first ffmpeg scene change
+  (`select='gt(scene,0.1)'`) = app appears; cut there, re-encode with libx264
+  (Cypress writes a keyframe only every 10s, so `-c copy` can't cut
+  accurately). Skips trimming if no change is found or it is past 15s. The raw
+  video in `cypress/videos/` stays untrimmed.
+- Between tests, Cypress shows its "Default blank page" (test isolation) for
+  ~1s; visible in the video. Not trimmed yet.
 - Bottom caption can still cover content near the bottom of a 720px viewport.
 
 ## Checking a video
