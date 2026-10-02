@@ -101,9 +101,15 @@ function watch(doc: Document) {
 // Fires for every page load in the app under test, including navigations.
 Cypress.on("window:load", (win) => render(win.document));
 
-// Don't let one test's caption leak into the next.
 beforeEach(() => {
+  // Don't let one test's caption leak into the next.
   currentCaption = null;
+  cy.document({ log: false }).then((doc) => render(doc));
+  // testIsolation is off (see cypress.config.ts), so do its state reset here,
+  // minus the about:blank navigation.
+  cy.clearAllCookies({ log: false });
+  cy.clearAllLocalStorage({ log: false });
+  cy.clearAllSessionStorage({ log: false });
 });
 
 Cypress.Commands.add("caption", (text: string, options: Cypress.CaptionOptions = {}) => {

@@ -5,6 +5,10 @@ export default defineConfig({
     baseUrl: "http://localhost:5173",
     supportFile: "cypress/support/e2e.ts",
     specPattern: "cypress/e2e/**/*.cy.ts",
+    // true would navigate to about:blank before each test, which shows up as
+    // a blank "Default blank page" flash in the video. The support file
+    // clears cookies and storage itself instead; every test must cy.visit().
+    testIsolation: false,
   },
   viewportWidth: 1280,
   viewportHeight: 720,
