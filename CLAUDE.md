@@ -139,7 +139,7 @@ remove it without re-checking a frame contact sheet.
   (`select='gt(scene,0.1)'`) = app appears; cut there, re-encode with libx264
   (Cypress writes a keyframe only every 10s, so `-c copy` can't cut
   accurately). Skips trimming if no change is found or it is past 15s. The raw
-  video in `cypress/videos/` stays untrimmed.
+  video in `cypress/videos/` is overwritten with the trimmed one too.
 - Between tests, Cypress shows its "Default blank page" (test isolation) for
   ~1s; visible in the video. Not trimmed yet.
 - Bottom caption can still cover content near the bottom of a 720px viewport.
