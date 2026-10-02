@@ -1,0 +1,19 @@
+{
+  "name": "pixel-commit",
+  "version": "0.0.1",
+  "description": "After every git commit, generate, run and record happy-path Cypress tests.",
+  "type": "module",
+  "bin": {
+    "pixel-commit": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
