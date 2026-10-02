@@ -15,5 +15,11 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "peerDependencies": {
+    "cypress": ">=13"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1"
   }
 }
