@@ -51,7 +51,8 @@ async function main() {
   const dest = path.join(outDir, path.basename(video));
   const ffmpeg = findFfmpeg();
   const trimmed = trimLoadingScreen(ffmpeg, video, dest);
-  if (trimmed === null) copyFileSync(video, dest);
+  // Keep Cypress's own copy in sync, so both places show the trimmed video.
+  copyFileSync(trimmed === null ? video : dest, trimmed === null ? dest : video);
 
   const sizeMb = statSync(dest).size / (1024 * 1024);
   const duration = videoDuration(ffmpeg, dest);
