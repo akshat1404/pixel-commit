@@ -6,7 +6,8 @@ import { globSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
-const MAX_TRIM_SECONDS = 15;
+/** Keep at least this much video after the cut; otherwise the "change" is suspect. */
+const MIN_REMAINING_SECONDS = 2;
 
 /**
  * Cypress ships its own ffmpeg inside the binary cache; fall back to one on
@@ -37,7 +38,7 @@ export function findFfmpeg(fromDir: string): string {
 }
 
 /**
- * Every Cypress video opens on a static placeholder (~3-6s) while the spec
+ * Every Cypress video opens on a static placeholder (~1-25s) while the spec
  * loads. The first scene change is the app appearing; cut everything before
  * it. Re-encodes, because Cypress writes a keyframe only every 10s and a
  * stream copy (-c copy) can only cut on keyframes. Returns seconds removed,
@@ -51,8 +52,10 @@ export function trimLoadingScreen(ffmpeg: string, src: string, dest: string): nu
   );
   const match = /pts_time:(\d+(?:\.\d+)?)/.exec(detect.stderr ?? "");
   const start = match ? Number(match[1]) : 0;
-  // Nothing to cut, or a "change" so late it is more likely a broken video.
-  if (start < 0.5 || start > MAX_TRIM_SECONDS) return null;
+  // Nothing to cut, or nothing left after the cut (a broken video). The
+  // placeholder can last 20s+ when the machine is busy, so no fixed cap.
+  const duration = videoDurationSeconds(ffmpeg, src);
+  if (start < 0.5 || duration === null || start > duration - MIN_REMAINING_SECONDS) return null;
 
   const encode = spawnSync(
     ffmpeg,

@@ -192,7 +192,7 @@ function copyVideos(session: SessionResult, projectDir: string, outDir: string):
       const trimmed = trimLoadingScreen(ffmpeg, run.video, dest);
       if (trimmed === null) {
         copyFileSync(run.video, dest);
-        log(`${video}: copied untrimmed (no loading screen found in the first 15s)`);
+        log(`${video}: copied untrimmed (no loading screen found)`);
       } else log(`${video}: trimmed ${trimmed.toFixed(2)}s loading screen`);
     }
     return {
