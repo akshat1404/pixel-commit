@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import path from "node:path";
 
 /** Run git and return trimmed stdout. Throws with git's stderr in the message. */
@@ -44,4 +44,21 @@ export function resolveCommit(root: string, rev: string): string {
 
 export function commitMessage(root: string, sha: string): string {
   return git(["log", "-1", "--format=%B", sha], root);
+}
+
+/** Run git and return raw stdout (untrimmed, large output allowed). */
+export function gitRaw(args: string[], cwd: string): string {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 256 * 1024 * 1024,
+    windowsHide: true,
+  });
+}
+
+/** `git merge-base --is-ancestor a b`: true if a is b or an ancestor of b. */
+export function isAncestor(root: string, a: string, b: string): boolean {
+  const res = spawnSync("git", ["merge-base", "--is-ancestor", a, b], { cwd: root, stdio: "ignore", windowsHide: true });
+  return res.status === 0;
 }
