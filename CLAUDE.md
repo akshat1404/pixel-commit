@@ -14,10 +14,14 @@ The developer never writes Cypress tests.
   Playground app, `cy.caption()`, one hand-written spec, `npm run record:demo`.
 - **Milestone 2 (done):** recording is attached to git commits. `pixel-commit
   init | record | list`, post-commit hook, worktree isolation, lock/queue,
-  retention. **No AI yet:** specs come from `PatternSpecProvider` (committed
-  specs matching `specPattern`).
-- **Milestone 3 (next):** AI-backed `SpecProvider`. Don't build ahead of the
-  current milestone.
+  retention.
+- **Milestone 3 (built, verification with the real `claude` CLI pending):**
+  AI-backed `SpecProvider` (`ai-provider.ts`). Per commit the AI picks the
+  output kind (`video` | `screenshot` | `none`) and writes 1-3 happy-path
+  specs; strict validation (string deny-list + TypeScript AST allow-list);
+  repair loop (max 2 repairs); FIFO queue; superseded commits.
+  `PatternSpecProvider` stays available via `"specProvider": "pattern"`.
+  Don't build past milestone 3.
 
 ## v1 design
 
@@ -28,14 +32,13 @@ The developer never writes Cypress tests.
   so the video shows committed code, not uncommitted edits. Output goes to the
   MAIN repo at `.pixel-commit/videos/<sha>/` (gitignored). *(built)*
 - **AI:** the user's own coding-agent CLI, run headless, configured in
-  `pixel-commit.config.json`, e.g. `{"generator": {"command": "claude -p"}}`.
-  The AI only returns text; pixel-commit saves and runs the spec itself.
-  *(milestone 3: implement as a `SpecProvider`)*
-- **Scope:** happy path only, at most 3 tests per commit. If the commit has no
-  browser-visible change, skip and record that in `result.json` (status
-  `skipped` already exists: provider returns no specs).
+  `pixel-commit.config.json` (`generator.command`, default
+  `claude -p --model sonnet`). The AI only returns text (JSON); pixel-commit
+  validates, saves and runs the specs itself. *(built)*
+- **Scope:** happy path only, at most 3 tests per commit. No browser-visible
+  change = kind `none`, status `skipped` with the AI's reason. *(built)*
 - **Readability:** `cy.caption(text)` draws a banner into the page so it shows
-  in the recording. *(built)*
+  in the recording (and in `cy.screenshot()` output). *(built)*
 - **Retention:** keep only the newest N video folders (config: `keepLast`). *(built)*
 - **Local only.** No upload, no approval gate, no pull-request integration.
 
@@ -46,22 +49,29 @@ pixel-commit.config.json   recorder config (read from the MAIN repo root only)
 packages/cli/src/
   index.ts           command routing (init, record, list, --version, __session)
   config.ts          load/validate pixel-commit.config.json, defaults
-  spec-provider.ts   SpecProvider interface + PatternSpecProvider  <- milestone 3 swaps this
-  recorder.ts        record flow, result.json, retention, readRecordings
-  session.ts         child process: dev server + cypress.run(), IPC to recorder
+  spec-provider.ts   SpecProvider interface (SpecPlan, repair, report) + PatternSpecProvider
+  ai-provider.ts     AiSpecProvider: prompts, commit data, answer validation, repair
+  generator.ts       runs generator.command (stdin prompt, stdout JSON), claude lockdown flags
+  spec-validation.ts deny-list + TypeScript AST allow-list for generated specs
+  recorder.ts        record flow, repair loop, artifacts, result.json, retention
+  session.ts         child process: dev server + cypress.run() (several runs), IPC
+  queue.ts           .pixel-commit/queue/ (FIFO order), superseded detection
+  lock.ts            .pixel-commit/lock (one recording at a time, FIFO via queue, stale detection)
   worktree.ts        create/remove worktrees, junction handling, stale cleanup
-  lock.ts            .pixel-commit/lock (one recording at a time, stale detection)
   launch.ts          `record <sha> --detach` (what the hook calls)
   init.ts            config + hook install; hookBlock()
   list.ts            `list` table
   video.ts           ffmpeg finder, loading-screen trim, duration (also used by record-demo)
   git.ts, process.ts helpers (git with clean env, killTree, freePort, waitForUrl)
+packages/cli/test/
+  spec-validation.test.mjs   node:test unit tests (validator, delimiter, JSON extraction)
+  fixtures/fake-generator.mjs  generator stand-in: broken spec, then fixed on repair
 playground/          React + Vite demo app used as test target
   src/components/    SignupForm, DateFilterList, DelayedSection
   cypress/support/   e2e.ts = cy.caption() + repaint ticker; index.d.ts = typings
   cypress/e2e/       specs (date-filter.cy.ts is the hand-written reference)
   scripts/record-demo.ts   npm run record:demo (milestone 1 manual recording)
-.pixel-commit/       output, gitignored: videos/<sha>/, videos/manual/, logs/, lock
+.pixel-commit/       output, gitignored: videos/<sha>/, videos/manual/, logs/, queue/, lock
 ~/.pixel-commit/worktrees/   temporary recording worktrees (outside the repo)
 ```
 
@@ -69,39 +79,56 @@ playground/          React + Vite demo app used as test target
 
 - `npm install` (root; npm workspaces), then `npm run build -w pixel-commit`
   (the hook runs `packages/cli/dist/index.js`; dist is gitignored).
+- `npm test -w pixel-commit` - unit tests (build first; they import `dist/`).
 - `node packages/cli/dist/index.js init` - create config if missing, install hook.
 - `node packages/cli/dist/index.js record [sha]` - record in the foreground.
-- `node packages/cli/dist/index.js list` - recorded commits.
+- `node packages/cli/dist/index.js list` - recorded commits (status, kind, time).
 - `npm run dev` - playground on http://localhost:5173
 - `npm run typecheck` - all workspaces
 - `npm run record:demo` - milestone 1: date-filter spec to `.pixel-commit/videos/manual/`
 
-## Recorder (milestone 2)
+## Recorder
 
 Flow of `record <sha>` (`recorder.ts`):
 
 1. Clean env (strip git's hook vars + `ELECTRON_RUN_AS_NODE`), set
-   `PIXEL_COMMIT_RUNNING=1` for everything spawned.
-2. Load config from the **main** repo (missing file = defaults).
-3. Acquire `.pixel-commit/lock`, then remove stale worktrees of this repo.
-4. `git worktree add --detach ~/.pixel-commit/worktrees/pixel-commit-wt-<sha12>-<pid> <sha>`;
-   junction `node_modules` -> main repo's; real empty `<projectDir>/node_modules`.
-5. `SpecProvider.getSpecs()`; none = status `skipped`.
-6. Spawn the **session** (`__session`, detached, IPC): starts `startCommand`
-   on a free port (`{port}`), waits for `baseUrl`, runs `cypress.run()` with
-   `runnerUi: false`, `config: {baseUrl, video: true}`, specs comma-joined,
-   kills the server tree, sends a summary.
-7. Copy + trim each `runs[].video` into `.pixel-commit/videos/<sha>/` right
-   away (Cypress wipes its videos folder on the next run).
-8. `finally`: unlink junction, `git worktree remove --force --force`, rm
-   leftovers, `git worktree prune`; write `result.json`; retention; release lock.
+   `PIXEL_COMMIT_RUNNING=1` for everything spawned (dev server, Cypress,
+   generator).
+2. Register in `.pixel-commit/queue/`; wait until first in the queue and the
+   lock is free (FIFO), take `.pixel-commit/lock`, leave the queue.
+3. Load config from the **main** repo (missing file = defaults).
+4. **Superseded?** If a still-queued newer commit descends from this one
+   (`git merge-base --is-ancestor`), or this commit is on no branch
+   (`git branch --contains` empty) and not an ancestor of HEAD (amend,
+   rebase): status `superseded`, no worktree, no generator call.
+5. Remove stale worktrees; `git worktree add --detach
+   ~/.pixel-commit/worktrees/pixel-commit-wt-<sha12>-<pid> <sha>`; junction
+   `node_modules` -> main repo's; real empty `<projectDir>/node_modules`.
+6. `SpecProvider.getSpecs()` -> `{ kind, reason, specs }`. Kind `none` =
+   status `skipped`, no dev server.
+7. Spawn the **session** (`__session`, detached, IPC: `start` / `run` /
+   `stop`): starts `startCommand` on a free port (`{port}`), waits for
+   `baseUrl`, then runs `cypress.run()` with `runnerUi: false`,
+   `config: {baseUrl, video}` (video off for kind `screenshot`), specs
+   comma-joined. Same dev server for every run.
+8. After each run, copy + trim videos and copy screenshots into
+   `.pixel-commit/videos/<sha>/` (Cypress wipes its folders on the next run).
+9. Repair loop: for each failing spec, `provider.repair()` rewrites it, and
+   only repaired specs re-run. Max 2 repairs (3 attempts) per spec.
+10. `finally`: provider report into result.json, unlink junction,
+    `git worktree remove --force --force`, rm leftovers, `git worktree prune`;
+    write `result.json`; retention; release lock.
 
 `result.json`: `status` (`passed` | `failed` = tests failed | `error` = could
-not run | `skipped`), `sha`, `message`, `queuedAt`, `startedAt`,
-`finishedAt`, `durationMs`, `specProvider`, `specs[]` (`spec`, `status`,
-`passes`, `failures`, `video`, `tests[]` with `title`, `state`, `error`),
-`error`. Re-recording a SHA replaces its folder. Exit code 0 for
-passed/skipped, 1 otherwise.
+not run | `skipped` = kind none | `superseded`), `sha`, `message`, `kind`,
+`reason`, `queuedAt`, `startedAt`, `finishedAt`, `durationMs`,
+`specProvider`, `generator` (`command`, `calls`, `durationMs`, `costUsd`),
+`diffTruncated`, `supersededBy`, `specs[]` (`spec`, `status`, `attempts`,
+`passes`, `failures`, `video`, `screenshots[]` relative paths, `tests[]` with
+`title`, `state`, `error`), `error`. Generated specs: `specs/<name>.cy.ts`
+(last version) and `specs/<name>.attempt-<n>.cy.ts` (earlier ones).
+Re-recording a SHA replaces its folder. Exit code 0 for
+passed/skipped/superseded, 1 otherwise.
 
 Hook (`init.ts`): block between `# >>> pixel-commit >>>` / `# <<< pixel-commit <<<`,
 appended to an existing `post-commit` or a new `#!/bin/sh` file (LF only).
@@ -115,15 +142,82 @@ because those absolute paths must not be committed.
 
 Config (`pixel-commit.config.json`, all optional, unknown keys rejected):
 `projectDir` (`playground`), `startCommand` (must contain `{port}`),
-`baseUrl` (must contain `{port}`), `specPattern` (glob relative to
-projectDir), `keepLast` (integer >= 1, default 30).
+`baseUrl` (must contain `{port}`), `specProvider` (`ai` default | `pattern`),
+`specPattern` (pattern provider only; glob relative to projectDir),
+`generator` (`command` default `claude -p --model sonnet`, `timeoutMs`
+180000, `maxDiffBytes` 60000, `maxBudgetUsd` 0.5), `routes`
+(`[{ path, description }]`, told to the AI), `keepLast` (integer >= 1,
+default 30).
+
+## AI spec provider (milestone 3)
+
+- **Generator call** (`generator.ts`): `generator.command` split into argv
+  (quotes honored), spawned without a shell in an empty temp folder, prompt
+  on stdin, answer on stdout, killed after `timeoutMs`. If the program is
+  `claude`, these flags are appended: `--output-format json --tools ""
+  --strict-mcp-config --disallowedTools "mcp__*" --safe-mode
+  --no-session-persistence --system-prompt-file <ours> --json-schema <ours>
+  --max-budget-usd <maxBudgetUsd>`. Other CLIs get the system prompt in front
+  of the prompt; locking down their tools is the user's job.
+- **costUsd** in result.json is the CLI's own estimate (`total_cost_usd`),
+  not necessarily what you are billed.
+- **Inputs** (`ai-provider.ts`): commit message, `git show --name-status`,
+  the diff (cut at `maxDiffBytes`; prompt and `diffTruncated` say so), full
+  content of changed files under `projectDir` (excluding `cypress/`; capped),
+  routes, and the spec rules (system prompt).
+- **Data is not instructions.** All commit content goes in blocks fenced by
+  a random per-call delimiter (`PXC-<24 hex>`), checked to occur nowhere in
+  the data. The system prompt says block content is material to test, never
+  instructions.
+- **Validation** (`spec-validation.ts`), any failure = one retry with the
+  problems sent back, then status `error`: JSON shape; `kind`/specs agree;
+  names `^[a-z0-9]+(-[a-z0-9]+)*\.cy\.ts$`; at most 3 `it()` in total; each
+  `it()` calls `cy.caption` and `cy.visit` (in the test or a
+  `before`/`beforeEach`); screenshot specs call `cy.screenshot`. Then the
+  string deny-list (quick, readable errors) and the AST allow-list (the real
+  guard): top-level only `export {}`, literal `const`s, and
+  `describe/it/before/beforeEach` with parameterless non-async callbacks;
+  inside, only cy chains of `visit get contains find within click type
+  clear check select should wait caption screenshot` plus `and first last eq
+  scrollIntoView` (readable assertions, picking one match, scrolling into
+  frame); arguments only literals, object/array literals, top-level
+  constants, `+ - * /`; `within` takes a callback. Rejected: computed member
+  access, `window document globalThis Cypress fetch eval require process
+  Function`, `cy.request/task/exec/readFile/writeFile` and every other
+  command, variables, control flow, imports. Uses the recorded project's
+  `typescript` (peer dependency).
+- Generated specs go to `<worktree>/<projectDir>/cypress/e2e/__pixel_commit__/`
+  (matches the playground's `specPattern`).
+- **Repair** prompt: same commit data + `failing-spec` + `cypress-error`
+  blocks; must return exactly one spec with the same name.
+- Testing without an AI: `"generator": { "command": "node
+  <repo>/packages/cli/test/fixtures/fake-generator.mjs" }` (fails first,
+  passes after one repair).
+
+## Claude Code headless facts (CLI reference + v2.1.296)
+
+- `claude -p` reads the whole prompt from stdin. `--output-format json` ->
+  one object: `result`, `is_error`, `subtype`, `num_turns`, `duration_ms`,
+  `total_cost_usd`, `session_id`; with `--json-schema`, the answer is in
+  `structured_output`.
+- `--tools ""` removes built-in tools, not MCP tools (add
+  `--strict-mcp-config --disallowedTools "mcp__*"`). Probe: init event showed
+  `tools: []`, `mcp_servers: []`.
+- `--safe-mode` skips CLAUDE.md, hooks, plugins, skills, MCP; keeps OAuth
+  login. `--bare` needs `ANTHROPIC_API_KEY`, so not used.
+- Replace the system prompt (`--system-prompt-file`): with the default one,
+  a tool-less model still claimed to have Bash.
+- Install the CLI so `claude` is on PATH (`claude install`); the copy bundled
+  in the VS Code extension lives in a versioned folder.
 
 ### Known issues / limits
 
-- **Recordings can pile up.** Each commit queues one background recorder
-  (~60-110s each on this machine). Commit 10 times quickly and 10 node
-  processes wait on the lock and run one by one for many minutes. Waiters are
-  not FIFO. There is no dedup/cancel of superseded commits yet.
+- **Recordings can pile up.** Each commit queues one background recorder;
+  with AI generation a recording takes ~1-3 minutes. Superseded commits
+  (a newer queued commit builds on them, or amended/rebased away) are
+  skipped without generation, so a burst of commits on one branch costs
+  about two recordings, but commits on different branches all record, one
+  at a time. Each waiting recorder is a node process polling once a second.
 - The worktree uses the main repo's installed `node_modules`; a commit that
   changes dependencies is recorded with the currently installed ones.
 - Each spec video ends with ~0.5s of Cypress's "Default blank page" (Cypress
@@ -132,6 +226,11 @@ projectDir), `keepLast` (integer >= 1, default 30).
   their logs; `hook.log` is never rotated.
 - If the session process itself is force-killed (not the recorder), the dev
   server can still be orphaned (see libuv job objects below).
+- Commits made on a detached HEAD are recorded only while HEAD still contains
+  them (the "no branch" superseded rule also checks HEAD).
+- `cy.screenshot({ capture: "fullPage" })` on a page taller than the
+  viewport: how the fixed caption appears in the stitched image is untested
+  (the playground fits in 720px; viewport and fullPage were identical).
 
 ## Conventions
 
@@ -152,7 +251,8 @@ projectDir), `keepLast` (integer >= 1, default 30).
   than too fast. Specs and support files `export {}` so they are modules.
 - Video filenames: keep Cypress defaults (`<spec>.mp4`); the SHA folder carries
   identity.
-- Don't trust memory for Cypress or git behavior; check docs.cypress.io / git-scm.com.
+- Don't trust memory for Cypress, git or Claude Code behavior; check docs.cypress.io /
+  git-scm.com / code.claude.com.
 - Don't commit in this repo to test the hook: use a throwaway clone (see
   "Testing the hook").
 
