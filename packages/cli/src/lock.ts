@@ -1,6 +1,7 @@
 import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
 import path from "node:path";
 import { isAlive, log, sleep } from "./process.js";
+import { dequeue, isFirst, liveEntries, type QueueEntry } from "./queue.js";
 
 interface LockInfo {
   pid: number;
@@ -12,19 +13,31 @@ const POLL_MS = 1000;
 
 /**
  * One recording at a time per repo. `.pixel-commit/lock` is created with
- * O_EXCL; others poll until it is gone (not strictly FIFO). A lock whose owner
- * PID is no longer alive is stale and gets removed. Returns a release function.
+ * O_EXCL. Waiters take it in queue order (FIFO): only the oldest live queue
+ * entry tries. A lock whose owner PID is no longer alive is stale and gets
+ * removed. On success the caller's queue entry is removed. Returns a release
+ * function.
  */
-export async function acquireLock(stateDir: string, sha: string): Promise<() => void> {
+export async function acquireLock(stateDir: string, sha: string, entry: QueueEntry): Promise<() => void> {
   const file = path.join(stateDir, "lock");
   let announced = false;
 
   for (;;) {
+    if (!isFirst(stateDir, entry)) {
+      if (!announced) {
+        const ahead = liveEntries(stateDir).findIndex((e) => e.file === entry.file);
+        log(`Waiting: ${ahead} recording(s) queued ahead of this one`);
+        announced = true;
+      }
+      await sleep(POLL_MS);
+      continue;
+    }
     try {
       const fd = openSync(file, "wx");
       const info: LockInfo = { pid: process.pid, sha, startedAt: new Date().toISOString() };
       writeSync(fd, JSON.stringify(info));
       closeSync(fd);
+      dequeue(entry);
       return () => releaseLock(file);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;

@@ -1,23 +1,32 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { AiSpecProvider } from "./ai-provider.js";
 import { type Config, ConfigError, loadConfig, withPort } from "./config.js";
 import { cleanEnvironment, commitMessage, repoRoot, resolveCommit } from "./git.js";
 import { acquireLock } from "./lock.js";
 import { errorText, freePort, killTree, log } from "./process.js";
-import type { SessionMessage, SessionRequest, SessionResult } from "./session.js";
-import { PatternSpecProvider, type SpecProvider } from "./spec-provider.js";
+import { dequeue, enqueue, supersededBy } from "./queue.js";
+import type { SessionCommand, SessionReply, SessionResult, SpecRun } from "./session.js";
+import { type OutputKind, PatternSpecProvider, type SpecContext, type SpecProvider } from "./spec-provider.js";
 import { findFfmpeg, trimLoadingScreen } from "./video.js";
 import { cleanupStaleWorktrees, createWorktree, removeWorktree } from "./worktree.js";
 
-export type RecordStatus = "passed" | "failed" | "error" | "skipped";
+export type RecordStatus = "passed" | "failed" | "error" | "skipped" | "superseded";
+
+/** A failing spec is repaired at most this many times (so up to 3 attempts). */
+const MAX_REPAIRS = 2;
 
 export interface SpecResult {
   spec: string;
   status: "passed" | "failed";
+  /** Versions of the spec that ran (1 = no repair). */
+  attempts: number;
   passes: number;
   failures: number;
   video: string | null;
+  /** Paths relative to the commit folder, e.g. screenshots/badge.png. */
+  screenshots: string[];
   tests: { title: string; state: string; error: string | null }[];
 }
 
@@ -25,11 +34,17 @@ export interface RecordResult {
   status: RecordStatus;
   sha: string;
   message: string;
+  kind: OutputKind | null;
+  reason: string | null;
   queuedAt: string;
   startedAt: string;
   finishedAt: string;
   durationMs: number;
-  specProvider: string;
+  specProvider: string | null;
+  /** AI provider only: { command, calls, durationMs, costUsd (CLI estimate) }. */
+  generator: Record<string, unknown> | null;
+  diffTruncated: boolean;
+  supersededBy: string | null;
   specs: SpecResult[];
   error: string | null;
 }
@@ -47,13 +62,14 @@ export function logsDir(root: string): string {
 }
 
 /**
- * Record `rev` (default HEAD): checkout in a temp worktree, start the dev
- * server on a free port, run Cypress with video, write
- * .pixel-commit/videos/<sha>/ in the main repo. Returns the process exit code.
+ * Record `rev` (default HEAD): checkout in a temp worktree, ask the spec
+ * provider what to run, start the dev server on a free port, run Cypress,
+ * write .pixel-commit/videos/<sha>/ in the main repo. Returns the exit code.
  */
-export async function record(rev: string, provider: SpecProvider = new PatternSpecProvider()): Promise<number> {
+export async function record(rev: string): Promise<number> {
   cleanEnvironment();
-  // Everything this process spawns inherits it; the post-commit hook exits early on it.
+  // Everything this process spawns (dev server, Cypress, the generator CLI)
+  // inherits it; the post-commit hook exits early on it.
   process.env.PIXEL_COMMIT_RUNNING = "1";
 
   const root = repoRoot();
@@ -69,7 +85,14 @@ export async function record(rev: string, provider: SpecProvider = new PatternSp
   log(`Recording ${sha.slice(0, 7)} "${message.split("\n")[0]}"`);
 
   mkdirSync(stateDir(root), { recursive: true });
-  const release = await acquireLock(stateDir(root), sha);
+  const entry = enqueue(stateDir(root), sha, queuedAt);
+  let release: () => void;
+  try {
+    release = await acquireLock(stateDir(root), sha, entry);
+  } catch (err) {
+    dequeue(entry);
+    throw err;
+  }
   const startedAt = new Date();
   const outDir = path.join(videosDir(root), sha);
   rmSync(outDir, { recursive: true, force: true });
@@ -79,44 +102,58 @@ export async function record(rev: string, provider: SpecProvider = new PatternSp
     status: "error",
     sha,
     message,
+    kind: null,
+    reason: null,
     queuedAt: queuedAt.toISOString(),
     startedAt: startedAt.toISOString(),
     finishedAt: "",
     durationMs: 0,
-    specProvider: provider.name,
+    specProvider: null,
+    generator: null,
+    diffTruncated: false,
+    supersededBy: null,
     specs: [],
     error: null,
   };
   let worktree: string | null = null;
+  let provider: SpecProvider | null = null;
 
   try {
     const { config, file } = loadConfig(root);
     log(file ? `Config: ${file}` : "Config: none found, using defaults");
-    cleanupStaleWorktrees(root);
 
-    worktree = createWorktree(root, sha, config.projectDir);
-    log(`Worktree: ${worktree}`);
-    const projectDir = path.join(worktree, config.projectDir);
-    if (!existsSync(projectDir)) throw new Error(`projectDir "${config.projectDir}" does not exist at this commit`);
-
-    const specs = await provider.getSpecs({ sha, worktreeDir: worktree, projectDir, config });
-    if (specs.length === 0) {
-      result = { ...result, status: "skipped", error: `No specs from provider "${provider.name}"` };
+    const superseded = supersededBy(root, stateDir(root), sha);
+    if (superseded) {
+      log(`Superseded: ${superseded.reason}`);
+      result = { ...result, status: "superseded", reason: superseded.reason, supersededBy: superseded.by };
     } else {
-      log(`Specs: ${specs.map((s) => path.relative(projectDir, s)).join(", ")}`);
-      const session = await runInSession(config, projectDir, specs);
-      log("Cypress finished; copying videos");
-      const specResults = copyVideos(session, projectDir, outDir);
-      result = {
-        ...result,
-        specs: specResults,
-        error: session.error,
-        status: session.error ? "error" : specResults.some((s) => s.status === "failed") ? "failed" : "passed",
-      };
+      cleanupStaleWorktrees(root);
+      worktree = createWorktree(root, sha, config.projectDir);
+      log(`Worktree: ${worktree}`);
+      const projectDir = path.join(worktree, config.projectDir);
+      if (!existsSync(projectDir)) throw new Error(`projectDir "${config.projectDir}" does not exist at this commit`);
+
+      provider = config.specProvider === "ai" ? new AiSpecProvider(path.join(outDir, "specs")) : new PatternSpecProvider();
+      result.specProvider = provider.name;
+      const ctx: SpecContext = { sha, worktreeDir: worktree, projectDir, config };
+      const plan = await provider.getSpecs(ctx);
+      result = { ...result, kind: plan.kind, reason: plan.reason };
+
+      if (plan.kind === "none" || plan.specs.length === 0) {
+        result.status = "skipped";
+        log(`Skipped: ${plan.reason}`);
+      } else {
+        log(`Specs (${plan.kind}): ${plan.specs.map((s) => path.relative(projectDir, s)).join(", ")}`);
+        const specs = await runWithRepairs(ctx, provider, plan.specs, plan.kind === "video", outDir);
+        result.specs = specs.results;
+        result.error = specs.error;
+        result.status = specs.error ? "error" : specs.results.some((s) => s.status === "failed") ? "failed" : "passed";
+      }
     }
   } catch (err) {
     result = { ...result, status: "error", error: err instanceof ConfigError ? err.message : errorText(err) };
   } finally {
+    if (provider?.report) Object.assign(result, provider.report());
     if (worktree) {
       try {
         removeWorktree(root, worktree);
@@ -138,18 +175,118 @@ export async function record(rev: string, provider: SpecProvider = new PatternSp
 
   log(`Done: ${result.status} in ${(result.durationMs / 1000).toFixed(1)}s -> ${outDir}`);
   if (result.error) log(`Error: ${result.error}`);
-  return result.status === "passed" || result.status === "skipped" ? 0 : 1;
+  return ["passed", "skipped", "superseded"].includes(result.status) ? 0 : 1;
 }
 
-async function runInSession(config: Config, projectDir: string, specs: string[]): Promise<SessionResult> {
-  const port = await freePort();
-  const request: SessionRequest = {
-    projectDir,
-    startCommand: withPort(config.startCommand, port),
-    baseUrl: withPort(config.baseUrl, port),
-    specs,
+/**
+ * Start the dev server once, run all specs, then repair and re-run failing
+ * specs (only those) up to MAX_REPAIRS times. Artifacts are copied out after
+ * every run, because Cypress wipes its videos/screenshots folders on the next.
+ */
+async function runWithRepairs(
+  ctx: SpecContext,
+  provider: SpecProvider,
+  specs: string[],
+  video: boolean,
+  outDir: string,
+): Promise<{ results: SpecResult[]; error: string | null }> {
+  const session = await Session.start(ctx.config, ctx.projectDir);
+  const results = new Map<string, SpecResult>();
+  const ffmpeg = video ? findFfmpeg(ctx.projectDir) : "ffmpeg";
+  try {
+    let toRun = specs;
+    for (let attempt = 1; ; attempt++) {
+      const run = await session.run(toRun, video);
+      log("Cypress finished; copying artifacts");
+      if (run.error) return { results: [...results.values()], error: run.error };
+      for (const r of run.runs) {
+        const abs = path.join(ctx.projectDir, r.spec);
+        results.set(abs, collect(r, attempt, results.get(abs), ffmpeg, outDir));
+      }
+      const failing = toRun.filter((s) => results.get(s)?.status === "failed");
+      if (failing.length === 0 || !provider.repair || attempt > MAX_REPAIRS) break;
+
+      toRun = [];
+      for (const spec of failing) {
+        const error = results.get(spec)!.tests.filter((t) => t.error).map((t) => `${t.title}\n${t.error}`).join("\n\n");
+        log(`Repairing ${path.basename(spec)} (attempt ${attempt + 1})`);
+        if (await provider.repair(ctx, spec, error || "The spec failed without a test error.")) toRun.push(spec);
+      }
+      if (toRun.length === 0) break;
+    }
+  } finally {
+    await session.stop();
+    removeIfEmpty(path.join(outDir, "screenshots"));
+  }
+  return { results: specs.map((s) => results.get(s)).filter((r): r is SpecResult => Boolean(r)), error: null };
+}
+
+function removeIfEmpty(dir: string): void {
+  try {
+    if (readdirSync(dir).length === 0) rmSync(dir, { recursive: true });
+  } catch {
+    // missing
+  }
+}
+
+/** Copy (and trim) one spec run's video and screenshots; replaces an earlier attempt's. */
+function collect(run: SpecRun, attempt: number, previous: SpecResult | undefined, ffmpeg: string, outDir: string): SpecResult {
+  for (const old of previous?.screenshots ?? []) rmSync(path.join(outDir, old), { force: true });
+
+  let video: string | null = null;
+  if (run.video && existsSync(run.video)) {
+    video = path.basename(run.video);
+    const dest = path.join(outDir, video);
+    const trimmed = trimLoadingScreen(ffmpeg, run.video, dest);
+    if (trimmed === null) {
+      copyFileSync(run.video, dest);
+      log(`${video}: copied untrimmed (no loading screen found)`);
+    } else log(`${video}: trimmed ${trimmed.toFixed(2)}s loading screen`);
+  }
+
+  const screenshots: string[] = [];
+  if (run.screenshots.length > 0) mkdirSync(path.join(outDir, "screenshots"), { recursive: true });
+  for (const shot of run.screenshots) {
+    if (!existsSync(shot)) continue;
+    let rel = path.join("screenshots", path.basename(shot));
+    for (let n = 2; screenshots.includes(rel); n++) rel = path.join("screenshots", `${n}-${path.basename(shot)}`);
+    copyFileSync(shot, path.join(outDir, rel));
+    screenshots.push(rel.replace(/\\/g, "/"));
+  }
+
+  return {
+    spec: run.spec,
+    status: run.failures > 0 ? "failed" : "passed",
+    attempts: attempt,
+    passes: run.passes,
+    failures: run.failures,
+    video,
+    screenshots,
+    tests: run.tests,
   };
-  return new Promise((resolve, reject) => {
+}
+
+/** Client side of the session process (see session.ts). */
+class Session {
+  private waiters: Array<(r: SessionReply) => void> = [];
+  private exited: Promise<void>;
+  private exitError: Error | null = null;
+
+  private constructor(private child: ChildProcess) {
+    child.on("message", (m: SessionReply) => {
+      this.waiters.shift()?.(m);
+    });
+    this.exited = new Promise((resolve) => {
+      child.on("exit", (code, signal) => {
+        this.exitError = new Error(`Recording session ended unexpectedly (code ${code}, signal ${signal})`);
+        for (const w of this.waiters.splice(0)) w({ type: "failed", error: this.exitError.message });
+        resolve();
+      });
+    });
+  }
+
+  static async start(config: Config, projectDir: string): Promise<Session> {
+    const port = await freePort();
     const child = spawn(process.execPath, [process.argv[1], "__session"], {
       cwd: projectDir,
       stdio: ["ignore", "inherit", "inherit", "ipc"],
@@ -162,48 +299,45 @@ async function runInSession(config: Config, projectDir: string, specs: string[])
       detached: true,
       windowsHide: true,
     });
-    let result: SessionResult | undefined;
     const onSigint = () => {
       log("Interrupted; stopping recording");
       if (child.pid) killTree(child.pid);
     };
     process.once("SIGINT", onSigint);
-    child.on("message", (m: SessionMessage) => {
-      if (m.type === "done") result = m.result;
-    });
-    child.on("error", reject);
-    child.on("exit", (code, signal) => {
-      process.off("SIGINT", onSigint);
-      if (result) resolve(result);
-      else reject(new Error(`Recording session ended without a result (code ${code}, signal ${signal})`));
-    });
-    child.send(request);
-  });
-}
+    child.on("exit", () => process.off("SIGINT", onSigint));
 
-/** Cypress wipes its videos folder on the next run: copy (and trim) right away. */
-function copyVideos(session: SessionResult, projectDir: string, outDir: string): SpecResult[] {
-  const ffmpeg = session.runs.some((r) => r.video) ? findFfmpeg(projectDir) : "ffmpeg";
-  return session.runs.map((run) => {
-    let video: string | null = null;
-    if (run.video && existsSync(run.video)) {
-      video = path.basename(run.video);
-      const dest = path.join(outDir, video);
-      const trimmed = trimLoadingScreen(ffmpeg, run.video, dest);
-      if (trimmed === null) {
-        copyFileSync(run.video, dest);
-        log(`${video}: copied untrimmed (no loading screen found)`);
-      } else log(`${video}: trimmed ${trimmed.toFixed(2)}s loading screen`);
+    const session = new Session(child);
+    const reply = await session.send({
+      type: "start",
+      projectDir,
+      startCommand: withPort(config.startCommand, port),
+      baseUrl: withPort(config.baseUrl, port),
+    });
+    if (reply.type !== "ready") {
+      await session.stop();
+      throw new Error(reply.type === "failed" ? reply.error : "unexpected reply from session");
     }
-    return {
-      spec: run.spec,
-      status: run.failures > 0 ? "failed" : "passed",
-      passes: run.passes,
-      failures: run.failures,
-      video,
-      tests: run.tests,
-    };
-  });
+    return session;
+  }
+
+  async run(specs: string[], video: boolean): Promise<SessionResult> {
+    const reply = await this.send({ type: "run", specs, video });
+    if (reply.type === "ran") return reply.result;
+    return { error: reply.type === "failed" ? reply.error : "unexpected reply from session", runs: [] };
+  }
+
+  async stop(): Promise<void> {
+    if (this.child.exitCode === null && this.child.connected) this.child.send({ type: "stop" } satisfies SessionCommand);
+    await this.exited;
+  }
+
+  private send(cmd: SessionCommand): Promise<SessionReply> {
+    if (this.exitError) return Promise.resolve({ type: "failed", error: this.exitError.message });
+    return new Promise((resolve) => {
+      this.waiters.push(resolve);
+      this.child.send(cmd);
+    });
+  }
 }
 
 function readKeepLast(root: string): number {
