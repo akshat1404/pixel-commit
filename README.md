@@ -18,8 +18,10 @@ Local, no upload.
 
 ## Setup
 
-Requires Node 22 or 24, git, and the Claude Code CLI on your PATH
-(`claude install`; you must be signed in).
+Requires Node 22 or 24, git, and Claude Code, signed in: either the
+VS Code extension (also found in Cursor and Windsurf) or the `claude` CLI.
+pixel-commit finds it by itself at every run: `claude` on your PATH first,
+otherwise the newest Claude Code extension.
 
 ```sh
 npm install

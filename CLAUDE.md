@@ -21,6 +21,7 @@ The developer never writes Cypress tests.
   specs; strict validation (string deny-list + TypeScript AST allow-list);
   repair loop (max 2 repairs); FIFO queue; superseded commits.
   `PatternSpecProvider` stays available via `"specProvider": "pattern"`.
+  Plan and design decisions: [docs/MILESTONE-3-PLAN.md](docs/MILESTONE-3-PLAN.md).
   Don't build past milestone 3.
 
 ## v1 design
@@ -52,6 +53,7 @@ packages/cli/src/
   spec-provider.ts   SpecProvider interface (SpecPlan, repair, report) + PatternSpecProvider
   ai-provider.ts     AiSpecProvider: prompts, commit data, answer validation, repair
   generator.ts       runs generator.command (stdin prompt, stdout JSON), claude lockdown flags
+  claude-finder.ts   finds claude: PATH, else newest editor extension (resolved every call)
   spec-validation.ts deny-list + TypeScript AST allow-list for generated specs
   recorder.ts        record flow, repair loop, artifacts, result.json, retention
   session.ts         child process: dev server + cypress.run() (several runs), IPC
@@ -65,6 +67,7 @@ packages/cli/src/
   git.ts, process.ts helpers (git with clean env, killTree, freePort, waitForUrl)
 packages/cli/test/
   spec-validation.test.mjs   node:test unit tests (validator, delimiter, JSON extraction)
+  claude-finder.test.mjs     finder tests (fake extension folders)
   fixtures/fake-generator.mjs  generator stand-in: broken spec, then fixed on repair
 playground/          React + Vite demo app used as test target
   src/components/    SignupForm, DateFilterList, DelayedSection
@@ -151,6 +154,18 @@ default 30).
 
 ## AI spec provider (milestone 3)
 
+- **Finding claude** (`claude-finder.ts`): when the program is a bare
+  `claude`, it is resolved at **every** call (never stored: editors rename
+  extension folders on each update): `claude[.exe]` on PATH, else the newest
+  `anthropic.claude-code-<version>*` folder (numeric version compare; folders
+  listed in the editor's `.obsolete` file are skipped) under
+  `~/.vscode`, `~/.vscode-insiders`, `~/.cursor`, `~/.windsurf`,
+  `~/.vscode-oss` `/extensions` that contains
+  `resources/native-binary/claude[.exe]` (the only file there on Windows,
+  v2.1.296). None: status `error`, "Claude Code not found: install the VS Code
+  extension or the claude CLI". The path used goes to
+  `result.json` `generator.resolvedPath`. A path in the command (e.g.
+  `C:/x/claude.exe -p`) is used as is.
 - **Generator call** (`generator.ts`): `generator.command` split into argv
   (quotes honored), spawned without a shell in an empty temp folder, prompt
   on stdin, answer on stdout, killed after `timeoutMs`. If the program is
@@ -207,8 +222,13 @@ default 30).
   login. `--bare` needs `ANTHROPIC_API_KEY`, so not used.
 - Replace the system prompt (`--system-prompt-file`): with the default one,
   a tool-less model still claimed to have Bash.
-- Install the CLI so `claude` is on PATH (`claude install`); the copy bundled
-  in the VS Code extension lives in a versioned folder.
+- Users need no separate install: the VS Code extension ships the same CLI
+  (`resources/native-binary/claude.exe`), found by `claude-finder.ts`. It
+  uses the extension's sign-in.
+- `--json-schema` works together with `--tools ""` (answer arrives in
+  `structured_output`; logs say `answer from structured_output`). If a
+  CLI version returns only text, the same validation runs on JSON parsed from
+  `result`.
 
 ### Known issues / limits
 
