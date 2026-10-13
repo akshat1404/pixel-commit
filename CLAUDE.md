@@ -15,7 +15,7 @@ The developer never writes Cypress tests.
 - **Milestone 2 (done):** recording is attached to git commits. `pixel-commit
   init | record | list`, post-commit hook, worktree isolation, lock/queue,
   retention.
-- **Milestone 3 (built, verification with the real `claude` CLI pending):**
+- **Milestone 3 (done, verified with real Claude Code via the VS Code extension):**
   AI-backed `SpecProvider` (`ai-provider.ts`). Per commit the AI picks the
   output kind (`video` | `screenshot` | `none`) and writes 1-3 happy-path
   specs; strict validation (string deny-list + TypeScript AST allow-list);
@@ -248,6 +248,10 @@ default 30).
   server can still be orphaned (see libuv job objects below).
 - Commits made on a detached HEAD are recorded only while HEAD still contains
   them (the "no branch" superseded rule also checks HEAD).
+- Real-model timings (sonnet, this machine): kind none ~8 s, screenshot
+  22-48 s, video ~48 s; 1 generator call each (7-15 s, est. $0.01-0.03).
+  The real model avoided a CSS-only-text trap (used the test id), so the repair
+  loop is proven only with `fake-generator.mjs` so far.
 - `cy.screenshot({ capture: "fullPage" })` on a page taller than the
   viewport: how the fixed caption appears in the stitched image is untested
   (the playground fits in 720px; viewport and fullPage were identical).
