@@ -99,6 +99,7 @@ export class AiSpecProvider implements SpecProvider {
   private data: CommitData | null = null;
   private ts: TypeScriptApi | null = null;
   private command: string | null = null;
+  private resolved: string | null = null;
   /** Repair attempt counter per spec name (attempt-1 is the first version). */
   private attempts = new Map<string, number>();
 
@@ -108,6 +109,7 @@ export class AiSpecProvider implements SpecProvider {
     return {
       generator: {
         command: this.command,
+        resolvedPath: this.resolved,
         calls: this.calls,
         durationMs: this.durationMs,
         // The CLI's own estimate, not necessarily what you are billed.
@@ -214,8 +216,9 @@ export class AiSpecProvider implements SpecProvider {
         this.calls += 1;
         const res = await runGenerator(ctx.config.generator, SYSTEM_PROMPT, prompt, ANSWER_SCHEMA);
         this.durationMs += res.durationMs;
+        this.resolved = res.program;
         if (res.costUsd !== null) this.costUsd = (this.costUsd ?? 0) + res.costUsd;
-        log(`Generator call ${this.calls}: ${(res.durationMs / 1000).toFixed(1)}s${res.costUsd !== null ? `, est. $${res.costUsd.toFixed(4)}` : ""}`);
+        log(`Generator call ${this.calls}: ${(res.durationMs / 1000).toFixed(1)}s${res.costUsd !== null ? `, est. $${res.costUsd.toFixed(4)}` : ""}, answer from ${res.source}`);
         answer = res.answer;
       } catch (err) {
         if (!(err instanceof GeneratorOutputError)) throw err;

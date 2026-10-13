@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { GeneratorConfig } from "./config.js";
+import { CLAUDE_NOT_FOUND, findClaude } from "./claude-finder.js";
 import { killTree } from "./process.js";
 
 export interface GeneratorAnswer {
@@ -15,6 +16,10 @@ export interface GeneratorAnswer {
   durationMs: number;
   /** The CLI's own cost estimate, if it reports one (claude does). Not a bill. */
   costUsd: number | null;
+  /** Executable actually run (claude is resolved at every call). */
+  program: string;
+  /** Where the JSON came from: claude's structured_output, or parsed from text. */
+  source: "structured_output" | "text";
 }
 
 export class GeneratorError extends Error {}
@@ -81,8 +86,16 @@ export async function runGenerator(
 ): Promise<GeneratorAnswer> {
   const argv = splitCommand(config.command);
   if (argv.length === 0) throw new GeneratorError("generator.command is empty");
-  const [program, ...args] = argv;
+  const [first, ...args] = argv;
+  let program = first;
   const claude = isClaude(program);
+  if (claude && !program.includes("/") && !program.includes("\\")) {
+    // Bare "claude": PATH, else the newest editor extension. Resolved every
+    // call because extension folders are renamed on every update.
+    const found = findClaude();
+    if (!found) throw new GeneratorError(CLAUDE_NOT_FOUND);
+    program = found;
+  }
 
   // Empty scratch folder as cwd: not the repo, not the worktree.
   const scratch = mkdtempSync(path.join(os.tmpdir(), "pixel-commit-gen-"));
@@ -105,15 +118,15 @@ export async function runGenerator(
     const { code, stdout, stderr } = await spawnWithInput(program, args, input, scratch, env, config.timeoutMs);
     const durationMs = Date.now() - started;
 
-    if (claude) return { ...parseClaude(stdout, stderr, code), durationMs };
+    if (claude) return { ...parseClaude(stdout, stderr, code), durationMs, program };
     if (code !== 0) throw new GeneratorError(`generator exited with code ${code}: ${tail(stderr || stdout)}`);
-    return { answer: extractJson(stdout), durationMs, costUsd: null };
+    return { answer: extractJson(stdout), durationMs, costUsd: null, program, source: "text" };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
 }
 
-function parseClaude(stdout: string, stderr: string, code: number | null): Omit<GeneratorAnswer, "durationMs"> {
+function parseClaude(stdout: string, stderr: string, code: number | null): Omit<GeneratorAnswer, "durationMs" | "program"> {
   let envelope: Record<string, unknown>;
   try {
     envelope = JSON.parse(stdout) as Record<string, unknown>;
@@ -126,9 +139,10 @@ function parseClaude(stdout: string, stderr: string, code: number | null): Omit<
   }
   // With --json-schema the validated object is in structured_output.
   if (envelope.structured_output !== undefined && envelope.structured_output !== null) {
-    return { answer: envelope.structured_output, costUsd };
+    return { answer: envelope.structured_output, costUsd, source: "structured_output" };
   }
-  return { answer: extractJson(String(envelope.result ?? "")), costUsd };
+  // Fallback: same validation runs on it afterwards (ai-provider.ts).
+  return { answer: extractJson(String(envelope.result ?? "")), costUsd, source: "text" };
 }
 
 /** Whole text as JSON, else a ```json fence, else first "{" to last "}". */
